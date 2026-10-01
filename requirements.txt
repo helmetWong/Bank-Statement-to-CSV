@@ -1,0 +1,8 @@
+# Bank Statement Parser - Python Dependencies
+# Requires Python 3.8 or higher
+
+pdfplumber>=0.10.0
+PyMuPDF>=1.23.0
+pytesseract>=0.3.10
+Pillow>=10.0.0
+openai>=1.0.0

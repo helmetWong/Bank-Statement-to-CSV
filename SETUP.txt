@@ -1,0 +1,73 @@
+# Setup Instructions
+
+## Prerequisites
+- Python 3.8 or higher
+- pip package manager
+- Tesseract OCR (system program)
+
+## Installation
+
+1. Clone this repository
+
+2. Install Python dependencies:
+   pip install -r requirements.txt
+
+3. Install Tesseract OCR (system program, not a Python package):
+
+   Windows:
+     Download the installer from
+     https://github.com/UB-Mannheim/tesseract/wiki
+     During installation, tick:
+       - Add Tesseract to PATH (optional)
+       - Additional language data: Chinese Traditional
+
+   macOS:
+     brew install tesseract tesseract-lang
+
+   Ubuntu/Debian:
+     sudo apt install tesseract-ocr tesseract-ocr-chi-tra
+
+4. Create the working directories:
+   mkdir key input output output\json output\csv
+
+   On macOS/Linux:
+   mkdir -p key input output/json output/csv
+
+5. Create your API key file:
+   key/deepseek_key.txt
+
+   The file must contain ONE LINE with your DeepSeek API key:
+   sk-your-actual-key-here
+
+## Usage
+
+1. Place the bank statement PDF in input/
+   Example: input/sample_statement.pdf
+
+2. Update config/config.csv:
+   - File:            the PDF filename in input/
+   - Page_start:      first page to process
+   - Page_end:        last page to process
+   - Bank:            bank identifier
+   - Style:           style file name (without .txt)
+   - Key_file:        API key filename in key/
+   - Statement_marker: text that begins each statement
+   - Language:        languages in the statement
+   - Currency:        currencies expected
+
+3. Run the pipeline in order:
+
+   python create_config_json.py
+   python read_pdf.py
+   python txt_to_json_API.py
+   python json_to_csv.py
+
+4. Find the final CSV files in output/csv/
+
+## Data Security
+- PDF and OCR text stay on your machine.
+- Only the OCR text is sent to DeepSeek for parsing.
+- The API key is stored locally in key/ and never leaves
+  your machine except when calling the DeepSeek API.
+- You are responsible for securing client data.
+- Do NOT commit key/ or output/ to version control.

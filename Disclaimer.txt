@@ -1,0 +1,92 @@
+# Disclaimer and Terms of Use
+
+## Important Notice
+
+This software tool ("Bank Statement Parser") is provided as a
+free, open-source utility to assist Hong Kong Certified Public
+Accountants (CPAs) with converting bank statement PDFs into
+structured CSV files. By using this software, you acknowledge
+and agree to the following terms:
+
+## 1. No Warranty
+
+The software is provided "AS IS" without any warranties, express
+or implied. The author makes no representations or warranties of
+any kind concerning:
+- The accuracy, completeness, or reliability of parsed data
+- The fitness of the software for any particular purpose
+- The continuous availability or error-free operation of the
+  software
+- The correctness of arithmetic verification results
+
+## 2. User Responsibility
+
+You, as the user, assume full responsibility for:
+- Verifying all parsed data against the original bank statements
+- Confirming that every amount, date, and description matches
+  the source document
+- Ensuring compliance with all applicable laws and regulations
+- Implementing appropriate data security measures for client
+  information
+- Making final determinations regarding the use of the output
+  in accounting records
+
+## 3. Limitation of Liability
+
+In no event shall the author be liable for any direct,
+indirect, incidental, special, exemplary, or consequential
+damages arising from:
+- The use of or inability to use the software
+- Any errors, omissions, or inaccuracies in the parsed data
+- Any decisions made or actions taken based on the software
+  output
+- Any regulatory non-compliance resulting from use of the
+  software
+
+## 4. Data Privacy and Security
+
+You are solely responsible for:
+- Securing client data during processing
+- Complying with all applicable data protection laws
+- Implementing appropriate access controls and security
+  measures
+- Ensuring proper data retention and disposal practices
+- Managing your DeepSeek API key and any costs incurred by
+  its use
+
+## 5. Third-Party Services
+
+The parsing step relies on the DeepSeek API, operated by a
+third party. The author of this software has no control over:
+- The availability, pricing, or terms of the DeepSeek API
+- The accuracy of the parsing performed by DeepSeek
+- Any changes to the DeepSeek API that may affect this
+  software
+
+Users are responsible for their own DeepSeek account and for
+complying with DeepSeek's terms of service.
+
+While third-party IT providers may charge for installation and
+support services:
+- They may not charge for the software itself
+- They may not create derivative works for resale
+- All support services are provided separately from the
+  software author
+
+## 6. Regulatory Compliance
+
+This tool is intended to assist with data extraction only. It
+does not provide accounting, tax, or legal advice. You must:
+- Verify all output against the original bank statements
+- Maintain proper documentation of your processing steps
+- Follow all applicable accounting and regulatory requirements
+- Consult with legal counsel for compliance assurance where
+  needed
+
+## 7. Copyright Notice
+
+Copyright (c) 2025 Wong Yun Wah Micheal. All rights reserved.
+
+The software remains the intellectual property of the author.
+While free to use and modify, users must maintain this
+copyright notice and disclaimer in all distributions.

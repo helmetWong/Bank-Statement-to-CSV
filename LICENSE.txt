@@ -1,0 +1,49 @@
+MIT License with Additional Terms
+
+Copyright (c) 2025 Wong Yun Wah Micheal
+
+Permission is hereby granted, free of charge, to any person
+obtaining a copy of this software and associated documentation
+files (the "Software"), to deal in the Software without
+restriction, including without limitation the rights to use,
+copy, modify, merge, publish, distribute, sublicense, and/or
+sell copies of the Software, and to permit persons to whom the
+Software is furnished to do so, subject to the following
+conditions:
+
+ADDITIONAL TERMS AND CONDITIONS:
+
+1. COMMERCIAL USE: The Software may be used for commercial
+   purposes, including by CPA practices and accounting firms
+   for their internal document processing.
+
+2. THIRD-PARTY SERVICES: Third-party IT service providers may
+   charge for installation, configuration, and support services
+   related to this Software, but may not charge for the Software
+   itself or create derivative works for resale.
+
+3. NO RESALE: Users may not repackage, resell, or charge others
+   for the Software itself. The Software must remain free to
+   use.
+
+4. DISCLAIMER: The Software is provided "AS IS", without
+   warranty of any kind, express or implied, including but not
+   limited to the warranties of merchantability, fitness for a
+   particular purpose and noninfringement. In no event shall the
+   authors or copyright holders be liable for any claim, damages
+   or other liability, whether in an action of contract, tort
+   or otherwise, arising from, out of or in connection with the
+   Software or the use or other dealings in the Software.
+
+5. COMPLIANCE RESPONSIBILITY: Users are solely responsible for
+   verifying parsed data against original bank statements and
+   for ensuring the accuracy of all amounts before use in
+   accounting records.
+
+6. DATA PRIVACY: Users are solely responsible for implementing
+   appropriate security measures to protect client data
+   processed by this Software, and for managing their own
+   DeepSeek API credentials.
+
+The above copyright notice and this permission notice shall be
+included in all copies or substantial portions of the Software.
