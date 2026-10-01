@@ -1,0 +1,530 @@
+================================================================================
+INSTRUCTION FILE: hsbc_hk.txt
+Bank: HSBC
+Style: hsbc_hk
+Applies to: HSBC Business Direct Statement (Hong Kong)
+Languages: English, Chinese
+Currencies: HKD, JPY (and any other foreign currency that may appear)
+================================================================================
+
+
+SECTION 1 — PURPOSE
+-------------------
+This instruction file tells the parser how to read an OCR text file containing
+one or more HSBC Hong Kong Business Direct statements and convert them into
+structured CSV files.
+
+The parser must:
+  (a) Identify each statement in the OCR file.
+  (b) Extract the account header, portfolio summary, and transaction rows.
+  (c) Separate transactions by currency and account type.
+  (d) Split transaction details into English and Chinese columns.
+  (e) Verify every row arithmetically.
+  (f) Cross-check against the statement's printed totals.
+  (g) Output clean CSVs ready for downstream use.
+
+
+SECTION 2 — INPUT CONFIGURATION
+-------------------------------
+The parser reads a JSON config file with the following keys:
+
+  Bank         : "hsbc"
+  Style        : "hsbc_hk"          <- determines which instruction file to use
+  File         : "HSBC_full_hk.pdf" <- source PDF (already converted to OCR txt)
+  Language     : ["English", "Chinese"]
+  Page_start   : "1"
+  Page_end     : "29"
+  Currency     : ["HKD", "JPY"]
+
+The OCR text file is the input. Its filename is derived from the "File" key
+by replacing ".pdf" with "_tesseract.txt" (or similar). The parser must
+process ALL pages from Page_start to Page_end inclusive.
+
+
+SECTION 3 — STATEMENT IDENTIFICATION
+------------------------------------
+3.1 A single OCR file may contain MULTIPLE statements from the same account.
+    Each statement spans 2 or 3 pages and starts with a header page containing
+    "HSBC Business Direct Statement" and a statement date.
+
+3.2 For each statement, extract:
+      - Statement Date   (e.g., "15 March 2024", "14 May 2024", "3 February 2025")
+      - Account Name     (e.g., "XXX LIMITED")
+      - Account Number   (e.g., "123-XXXXXX-001")
+      - Branch           (e.g., "KWUN TONG")
+      - Page count       (e.g., "Page 1 of 2", "Page 2 of 3")
+
+3.3 Statement dates follow the pattern:  DD Month YYYY
+    Months are: January, February, March, April, May, June, July, August,
+                September, October, November, December.
+    Convert to ISO format: YYYY-MM-DD.
+
+3.4 Each statement dated on the 15th (or thereabouts) covers the PREVIOUS
+    calendar month's activity. For example:
+      - 15 March 2024 statement covers February 2024 activity.
+      - 15 April 2024 statement covers March 2024 activity.
+      - 14 May 2024 statement covers April 2024 activity.
+    Use this to assign each transaction to the correct month for reporting.
+
+
+SECTION 4 — STATEMENT ORDER HANDLING
+------------------------------------
+4.1 The OCR file may contain statements in any order:
+      (a) Ascending chronological   (Jan -> Dec)
+      (b) Reverse chronological     (Dec -> Jan)   <- COMMON
+      (c) Random order
+      (d) With duplicates
+
+4.2 ALWAYS sort statements chronologically by Statement Date before parsing
+    transactions. Do NOT assume the first statement in the file is the earliest.
+
+4.3 DEDUPLICATION:
+    If two or more pages have the same Statement Date AND the same Account
+    Number AND the same transaction content, treat them as duplicates and
+    keep only one copy. Record the duplicate count in the verification output.
+
+4.4 CROSS-MONTH CONTINUITY:
+    After sorting, verify:
+        Prior month closing balance == Next month B/F balance
+    for each currency/account separately. If a mismatch is found, record it
+    in the Verify_total output. If a B/F row is missing entirely, note it.
+
+4.5 OUTPUT ORDER:
+    All CSV rows must be in ascending chronological order (earliest first),
+    regardless of the source file order.
+
+
+SECTION 5 — SECTION TYPES WITHIN A STATEMENT
+--------------------------------------------
+Each HSBC statement contains these sections. The parser must recognise them
+by their English and/or Chinese headings:
+
+  5.1 HEADER
+      - Bank name, account name, account number, branch, statement date
+      - Page number (e.g., "Page 1 of 2")
+      - Legal notices (ignore for transaction parsing)
+
+  5.2 PORTFOLIO SUMMARY  (資產摘要)
+      - Total balance in HKD  (港元結餘)
+      - Total balance in Foreign Currency  (外幣結餘)
+      - Total balance in Overdraft  (總透支)
+      - Net Position  (淨額)
+      - Per-account table: Account Number, CCY, Balance, HKD Equivalent
+
+  5.3 ASSET PORTFOLIO  (資產組合)
+      - HKD Deposits  (港元存款) with HKD equivalent and percentage
+      - Others  (其他) with HKD equivalent and percentage
+
+  5.4 ACCOUNT ACTIVITIES  (戶口進支紀錄)
+      - One sub-section per account type:
+          * HKD Savings  (港元儲蓄)
+          * Foreign Currency Savings  (外幣儲蓄)
+      - Each sub-section has columns:
+          Date | Transaction Details | Deposit | Withdrawal | Balance
+      - Bilingual headers: 日期 | 進支詳情 | 存入 | 提取 | 結餘
+
+  5.5 SUMMARY TOTALS (at end of each account sub-section)
+      - Total No. of Deposits
+      - Total No. of Withdrawals
+      - Total Deposit Amount
+      - Total Withdrawal Amount
+
+  5.6 EXCHANGE RATE  (匯率)
+      - Currency code and rate (e.g., JPY 0.052697)
+
+  5.7 SPECIAL PRIVILEGES  (專享優惠)
+      - Average Total Relationship Balance and fee waiver notices
+      - Ignore for transaction parsing
+
+  5.8 NOTICES
+      - Account closure notices, terms amendments, severe weather notices
+      - Ignore for transaction parsing, but flag account closure in output
+
+
+SECTION 6 — TRANSACTION ROW PARSING
+-----------------------------------
+6.1 Each transaction row has the format:
+      Date | Details | Deposit | Withdrawal | Balance
+
+6.2 DATE:
+    Format: DD Mon  (e.g., "21 Feb", "3 Sep")
+    No year is shown. Infer year from the Statement Date:
+      - If the transaction month is <= statement month, use the statement year.
+      - If the transaction month > statement month, use (statement year - 1).
+    Convert to ISO: YYYY-MM-DD.
+
+6.3 DETAILS:
+    A multi-line field that may contain:
+      - Counterparty name (e.g., "XXX")
+      - Reference number (e.g., "HC000000")
+      - Date embedded in reference (e.g., "21FEB")
+      - Description in English (e.g., "CREDIT INTEREST", "DEPOSIT")
+      - Description in Chinese (e.g., "轉賬收入", "利息收入")
+    Split into two columns:
+      - Details_Eng : all English/Latin characters and digits
+      - Details_Ch  : all Chinese characters
+    Leave Details_Ch blank if no Chinese characters are present.
+
+6.4 DEPOSIT / WITHDRAWAL / BALANCE:
+    Numeric fields with thousands separators and 2 decimal places.
+    - Deposit amounts appear in the "Deposit" column.
+    - Withdrawal amounts appear in the "Withdrawal" column.
+    - Balance appears in the "Balance" column.
+    - OCR may misread "1" as "4", "9" as "0", "." as ",", etc.
+      Use arithmetic verification (Section 8) to detect and correct.
+
+6.5 B/F BALANCE ROW:
+    A row starting with "B/F BALANCE" or "承前轉結" is an opening balance,
+    NOT a real transaction. It has no deposit/withdrawal — only a balance.
+    RULE: Remove the B/F row from the transaction table. Carry its balance
+    into the Remark of the NEXT transaction row as "B/F = {balance}".
+    If the B/F row is the ONLY row in that account/month, create a summary
+    row with empty date/details/deposit/withdrawal and the balance, with
+    Remark "B/F = {balance}; end of month = {balance}".
+
+6.6 END-OF-MONTH BALANCE:
+    The last transaction row of each month/account carries the closing
+    balance. Add to its Remark: "end of month = {balance}".
+
+6.7 **CRITICAL — ONE DEPOSIT OR ONE WITHDRAWAL PER ROW**
+    --------------------------------------------------------------------------
+    HSBC statements may show MULTIPLE transactions on the SAME DATE, but
+    display the running balance only ONCE — after the net effect of all
+    transactions on that date.
+
+    RULE: Each output CSV row must contain EITHER a deposit OR a withdrawal.
+          NEVER both in the same row.
+
+    When the OCR text shows multiple transactions on the same date:
+      (a) Split them into separate rows — one per transaction.
+      (b) Each row carries its own deposit OR withdrawal amount.
+      (c) ONLY the LAST transaction on that date carries the balance.
+      (d) ALL EARLIER transactions on the same date have an EMPTY balance
+          field.
+      (e) The Verify_row for the LAST transaction on that date must verify
+          the cumulative net effect of all same-date transactions.
+
+    EXAMPLE — 27 Sep 2024 (from 25 Oct 2024 statement):
+      OCR text shows:
+        27 Sep CHARGES HC0000 27SEP 轉賬支出 5.00
+        27 Sep PAYEE a** HC000 27SEP 轉賬支出 910.00
+        27 Sep CHARGES HC0000 27SEP 轉賬支出 5.00
+        27 Sep PAYEE b** HC0000 27SEP 轉賬支出 39,999.99 
+
+    Output rows:
+      Row 1: 2024-09-27 | CHARGES ... | | 5.00 | (empty) | ...
+      Row 2: 2024-09-27 | PAYEE A ... | | 910.00 | (empty) | ...
+      Row 3: 2024-09-27 | CHARGES ... | | 5.00 | (empty) | ...
+      Row 4: 2024-09-27 | PAYEE B ... | | 39,999.99 | 1,000,000.00 | ...
+	
+
+6.8 **SAME-DATE GROUP VERIFICATION**
+    --------------------------------------------------------------------------
+    For each date with multiple transactions:
+      1. Identify the previous day's closing balance (or the opening balance
+         if this is the first date in the statement).
+      2. Sum all deposits on this date:  D = Σ deposits
+      3. Sum all withdrawals on this date: W = Σ withdrawals
+      4. Verify:  previous_closing + D − W == shown_balance
+      5. Record in the Verify_row of the LAST transaction on that date:
+           "checked: {prev} + {D} - {W} = {shown}"
+         If mismatch:
+           "checked: MISMATCH expected {X}, stated {Y}, diff {Z}"
+
+    For earlier transactions on the same date, record in Verify_row:
+      "same-date group; balance shown on last row of {date}"
+
+6.9 **CLOSING BALANCE CHECK PER DATE**
+    --------------------------------------------------------------------------
+    After processing all transactions for a given date, the balance shown
+    on the last transaction of that date MUST equal:
+        previous_day_closing_balance + sum(deposits) − sum(withdrawals)
+
+    If the date has only ONE transaction, this reduces to the standard
+    running-balance check (Section 8.1).
+
+    If the date has MULTIPLE transactions and NO balance is shown on the
+    last row, flag it:
+        "checked: no balance shown for {date}; cannot verify"
+
+
+SECTION 7 — OUTPUT STRUCTURE
+----------------------------
+7.1 SEPARATE CSVs BY CURRENCY AND ACCOUNT:
+    Produce one CSV per (account type, currency) combination. For HSBC:
+      - hsbc_{account}_HKD_savings_{period}.csv
+      - hsbc_{account}_JPY_savings_{period}.csv
+    where {account} is the account number (e.g., 123-XXXXXX-001) and
+    {period} is the date range (e.g., 2024-2025).
+
+7.2 TRANSACTION CSV COLUMNS (exact order):
+      date, details_eng, details_ch, deposit, withdrawal, balance,
+      remark, verify_row
+
+    Column definitions:
+      date         : ISO date (YYYY-MM-DD)
+      details_eng  : English portion of transaction details
+      details_ch   : Chinese portion of transaction details (blank if none)
+      deposit      : Deposit amount (blank if none)
+      withdrawal   : Withdrawal amount (blank if none)
+      balance      : Running balance after transaction (blank if same-date
+                     group and not the last row)
+      remark       : Business remarks only:
+                       - "B/F = {balance}" when a B/F row was removed
+                       - "end of month = {balance}" on the last row of a month
+                       - "account closed" when applicable
+                       - Multiple remarks separated by "; "
+      verify_row   : Arithmetic verification result. Format:
+                       "checked: {prev} + {dep} - {wd} = {bal}"
+                     For same-date groups:
+                       "checked: {prev} + {D} - {W} = {bal}"
+                     If OCR correction was applied:
+                       "checked: ...; OCR {field} was {old}, corrected to {new}"
+                     If a mismatch remains:
+                       "checked: MISMATCH expected {X}, stated {Y}, diff {Z}"
+
+7.3 TOTAL VERIFICATION CSV COLUMNS:
+      statement_date, account, ccy, deposits_count_stated,
+      deposits_count_actual, withdrawals_count_stated,
+      withdrawals_count_actual, deposit_total_stated, deposit_total_actual,
+      withdrawal_total_stated, withdrawal_total_actual, check_result
+
+7.4 CROSS-MONTH CONTINUITY CSV COLUMNS:
+      check, prior_closing, next_bf, match
+
+7.5 NET MOVEMENT CSV COLUMNS:
+      month, opening, total_deposits, total_withdrawals, closing,
+      opening_plus_deposits_minus_withdrawals, match
+
+
+SECTION 8 — VERIFICATION RULES
+------------------------------
+8.1 LAYER 1 — RUNNING BALANCE (per row):
+    For each row (except the first/opening row):
+        previous_balance + deposit - withdrawal == balance
+    If equal:  Verify_row = "checked: {prev} + {dep} - {wd} = {bal}"
+    If not equal: attempt to identify an OCR error in the row's deposit,
+                  withdrawal, or balance. If a correction is confirmed by
+                  cross-checking against printed totals, apply it and note
+                  the original value in Verify_row.
+                  If no correction is possible, mark as MISMATCH.
+
+8.2 LAYER 2 — TOTAL COUNTS & AMOUNTS (per statement):
+    Cross-check against the statement's printed summary:
+        Number of deposit rows   == Total No. of Deposits
+        Number of withdrawal rows == Total No. of Withdrawals
+        Sum of deposit amounts    == Total Deposit Amount
+        Sum of withdrawal amounts == Total Withdrawal Amount
+    Record results in the Total Verification CSV.
+
+8.3 LAYER 3 — CROSS-MONTH CONTINUITY:
+    For each month boundary:
+        Prior month closing balance == Next month B/F balance
+    Record results in the Cross-Month Continuity CSV.
+
+8.4 LAYER 4 — NET MOVEMENT:
+    For each month:
+        opening + total_deposits - total_withdrawals == closing
+    Record results in the Net Movement CSV.
+
+8.5 OCR CORRECTION GUIDELINES:
+    Common OCR errors in HSBC statements:
+      - "1" misread as "4" (e.g., 10,000 -> 40,000)
+      - "9" misread as "0" (e.g., 98,394.77 -> 98,304.77)
+      - "." misread as "," (e.g., 1,895,743.42 -> 1,895,743,42)
+      - Extra spaces in numbers (e.g., "2,839, 153,44")
+      - Missing "A" in reference numbers (e.g., HC124A... -> HC124...)
+      - Chinese characters garbled (e.g., "轉賬" -> "轉 賬")
+    Use arithmetic checks and printed totals to confirm corrections.
+    Always record the original OCR value in Verify_row.
+
+8.6 LAYER 5 — SAME-DATE GROUP VERIFICATION:
+    For each date with multiple transactions:
+        previous_closing + Σ(deposits) − Σ(withdrawals) == shown_balance
+    Record results in the Verify_row of the LAST transaction on that date.
+    For earlier transactions on the same date, record:
+        "same-date group; balance shown on last row of {date}"
+
+
+SECTION 9 — BILINGUAL HANDLING
+------------------------------
+9.1 English and Chinese text may appear:
+      - On the same line
+      - On separate lines
+      - Interleaved with OCR noise
+
+9.2 Column headings are bilingual:
+      Date / 日期
+      Transaction Details / 進支詳情
+      Deposit / 存入
+      Withdrawal / 提取
+      Balance / 結餘
+      Total No. of Deposits / 存入次數總計
+      Total No. of Withdrawals / 提取次數總計
+      Total Deposit Amount / 存入總額
+      Total Withdrawal Amount / 提取總額
+      Exchange Rate / 匯率
+      Portfolio Summary / 資產摘要
+      Account Activities / 戶口進支紀錄
+      HKD Savings / 港元儲蓄
+      Foreign Currency Savings / 外幣儲蓄
+
+9.3 For transaction details, split into Details_Eng and Details_Ch:
+      - Keep all Latin letters, digits, and punctuation in Details_Eng
+      - Keep all CJK characters in Details_Ch
+      - Trim whitespace from both
+      - If one side is empty, leave it blank in the CSV
+
+
+SECTION 10 — MULTI-CURRENCY HANDLING
+------------------------------------
+10.1 Each currency gets its own account sub-section and its own CSV.
+     Common currencies: HKD, JPY, USD, CNY, GBP, EUR.
+     The Currency list in config.json tells you which to expect.
+
+10.2 Currency codes appear as prefixes in transaction rows:
+       "HKD 108,411.31"
+       "JPY 100"
+     Strip the currency code before parsing the numeric value.
+
+10.3 Exchange rates are stated once per statement near the end:
+       "Exchange Rate 匯率"
+       "JPY 0.052697"
+     Use the rate to compute HKD equivalents for foreign currency balances.
+
+10.4 If a currency appears in config.json but not in a given statement,
+     do not create an empty CSV for it.
+
+
+SECTION 11 — SPECIAL CASES
+--------------------------
+11.1 ACCOUNT CLOSURE:
+     Statements may contain: "Your account will be closed..." or
+     "Your account has now been closed..."
+     Flag the account as closed in the last transaction row's Remark:
+       "account closed"
+     The final transaction is usually a full-balance withdrawal to 0.00.
+
+11.2 MULTI-PAGE STATEMENTS:
+     A statement may span 2 or 3 pages. The parser must combine all pages
+     belonging to the same Statement Date before parsing transactions.
+
+11.3 DUPLICATE PAGES:
+     The same page may appear twice in the OCR file. Detect duplicates by
+     Statement Date + Account Number + transaction content and keep only one.
+
+11.4 STATEMENT PERIOD LABEL OFFSET:
+     A statement dated on the 15th covers the PREVIOUS month's activity.
+     When computing net movement per calendar month, align transactions to
+     their actual transaction month (from the transaction date), not the
+     statement date.
+
+11.5 OCR NOISE:
+     Ignore lines that are clearly OCR noise (e.g., "M |", "|", "HEE A | RA |",
+     "HSBC > 7d =e |", random characters). Keep only lines that contribute
+     to the structured output.
+
+11.6 MISSING TRANSACTION LINES:
+     If the running balance breaks and the statement's printed withdrawal
+     total exceeds the sum of itemized withdrawals, some transaction lines
+     were likely dropped by OCR. Insert a placeholder row with details
+     "(see note)" and the balancing amount, and flag it in Verify_row:
+       "OCR omission suspected; balancing figure inserted"
+
+11.7 SAME-DATE MULTIPLE TRANSACTIONS:
+     See Section 6.7, 6.8, and 6.9. This is a common pattern in HSBC
+     statements and must be handled explicitly.
+
+
+SECTION 12 — EXECUTION WORKFLOW
+-------------------------------
+Step 1:  Read config.json. Confirm Bank = "hsbc" and Style = "hsbc_hk".
+Step 2:  Read this instruction file (hsbc_hk.txt).
+Step 3:  Read the OCR text file (from config.File, pages Page_start..Page_end).
+Step 4:  Identify all statements in the file.
+Step 5:  Sort statements chronologically. Remove duplicates.
+Step 6:  For each statement, extract header, portfolio summary, and
+         account activities.
+Step 7:  For each account type and currency, parse transaction rows.
+Step 8:  Group transactions by date. For each date with multiple
+         transactions, apply Section 6.7 rules:
+           - Split into separate rows (one deposit OR one withdrawal each)
+           - Only the last row carries the balance
+           - Earlier rows have empty balance
+Step 9:  Remove B/F BALANCE rows; carry their balances into the next row's
+         Remark.
+Step 10: Add "end of month = {balance}" to the last row of each month.
+Step 11: Perform Layer 1 verification (running balance) row by row.
+Step 12: Perform Layer 5 verification (same-date group) for multi-transaction
+         dates.
+Step 13: Perform Layer 2 verification (total counts and amounts) per statement.
+Step 14: Perform Layer 3 verification (cross-month continuity).
+Step 15: Perform Layer 4 verification (net movement per month).
+Step 16: Split Details into Details_Eng and Details_Ch.
+Step 17: Write output CSVs.
+Step 18: Print a summary of verification results and any flagged issues.
+
+
+SECTION 13 — OUTPUT FILE NAMING
+-------------------------------
+Use this naming convention:
+
+  Transactions:
+    hsbc_{account}_{ccy}_{account_type}_{period}.csv
+    e.g., hsbc_123-XXXXXX-001_HKD_savings_2024-2025.csv
+          hsbc_123-XXXXXX-001_JPY_savings_2024-2025.csv
+
+  Verification:
+    hsbc_{account}_total_verification_{period}.csv
+    hsbc_{account}_cross_month_continuity_{period}.csv
+    hsbc_{account}_net_movement_{period}.csv
+    hsbc_{account}_same_date_groups_{period}.csv
+
+Where:
+  {account}      = account number with hyphens (e.g., 123-XXXXXX-001)
+  {ccy}          = currency code (HKD, JPY, ...)
+  {account_type} = "savings" (or "current", "deposits", etc.)
+  {period}       = date range (e.g., 2024-2025)
+
+
+SECTION 14 — ERROR HANDLING
+---------------------------
+14.1 If a statement date cannot be read, skip the statement and log a warning.
+14.2 If an account number cannot be read, use the previous statement's number
+     and log a warning.
+14.3 If a transaction amount cannot be read, mark the field as blank and
+     note "OCR unreadable" in Verify_row.
+14.4 If a running balance breaks and cannot be corrected, mark the row as
+     MISMATCH in Verify_row and continue parsing.
+14.5 If a printed total does not match the sum of itemized rows, flag it in
+     the Total Verification CSV with the difference.
+14.6 If a same-date group has no balance shown on its last row, flag it in
+     Verify_row: "checked: no balance shown for {date}; cannot verify".
+14.7 Never invent data. If a value is unreadable, leave it blank and flag it.
+
+
+SECTION 15 — SUMMARY OF RULES
+-----------------------------
+  R1.  Sort statements chronologically before parsing.
+  R2.  Remove duplicate statement pages.
+  R3.  Separate output by currency and account type.
+  R4.  Split Details into Details_Eng and Details_Ch.
+  R5.  Remove B/F BALANCE rows; carry balance to next row's Remark.
+  R6.  Add "end of month = {balance}" to the last row of each month.
+  R7.  Verify every row: prev + deposit - withdrawal == balance.
+  R8.  Verify statement totals: counts and amounts.
+  R9.  Verify cross-month continuity: prior closing == next B/F.
+  R10. Verify net movement: opening + deposits - withdrawals == closing.
+  R11. One deposit OR one withdrawal per row. NEVER both.
+  R12. For same-date multiple transactions: only the last row carries the
+       balance; earlier rows have empty balance.
+  R13. Verify same-date groups: prev + Σ(deposits) - Σ(withdrawals) == shown.
+  R14. Record all verification results in Verify_row and Verify_total.
+  R15. Record all OCR corrections in Verify_row.
+  R16. Never invent data; flag unreadable values.
+  R17. Output CSVs in ascending chronological order.
+  R18. Use the file naming convention in Section 13.
+
+================================================================================
+END OF INSTRUCTION FILE: hsbc_hk.txt
+================================================================================

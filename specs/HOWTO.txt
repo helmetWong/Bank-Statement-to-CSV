@@ -1,0 +1,398 @@
+================================================================
+HOW TO RUN THE BANK STATEMENT PIPELINE
+Version 2026.10.01
+Last updated: 2026-10-01
+================================================================
+
+QUICK OVERVIEW
+--------------
+Four steps, run in order. Each step is a separate Python file.
+
+    1. Edit config/config.csv
+    2. Run create_config_json.py
+    3. Run read_pdf.py
+    4. Run txt_to_json_API.py
+    5. Run json_to_csv.py
+
+Result: output/csv/*.csv are your final accounting files.
+
+
+================================================================
+STEP 0 — ONE-TIME SETUP (DO THIS ONLY ONCE)
+================================================================
+
+A. Install Python packages:
+
+    pip install pdfplumber PyMuPDF pytesseract Pillow openai
+
+B. Install Tesseract OCR (system program, not Python):
+
+    Windows:
+        Download from https://github.com/UB-Mannheim/tesseract/wiki
+        During install:
+            - Tick "Add to PATH" (optional)
+            - Tick "Additional language data: Chinese Traditional"
+
+    macOS:
+        brew install tesseract tesseract-lang
+
+    Ubuntu/Debian:
+        sudo apt install tesseract-ocr tesseract-ocr-chi-tra
+
+C. Create the key folder and put your DeepSeek API key in it:
+
+    key/deepseek_key.txt
+
+    The file must contain ONE LINE:
+        sk-your-actual-key-here
+
+D. Confirm the project layout:
+
+    project/
+    ├── config/
+    │   ├── config.csv
+    │   ├── config.json          (created by step 2)
+    │   └── styles/
+    │       └── hsbc_hk.txt
+    ├── key/
+    │   └── deepseek_key.txt
+    ├── input/
+    │   └── HSBC_full_hk.pdf
+    ├── output/
+    │   ├── json/                (created by step 4)
+    │   └── csv/                 (created by step 5)
+    ├── create_config_json.py
+    ├── read_pdf.py
+    ├── txt_to_json_API.py
+    └── json_to_csv.py
+
+
+================================================================
+STEP 1 — EDIT config/config.csv
+================================================================
+
+Open config/config.csv in a text editor.
+
+Update these lines:
+
+    File        The PDF filename in input/  (e.g. HSBC_full_hk.pdf)
+    Page_start  First page to process       (e.g. 1)
+    Page_end    Last page to process        (e.g. 29)
+
+Leave these lines alone unless the task changes:
+
+    Bank        Bank identifier            (e.g. hsbc)
+    Style       Style file name            (e.g. hsbc_hk)
+    Key_file    API key filename           (e.g. deepseek_key.txt)
+    Language    Languages in the statement (e.g. English, Chinese)
+    Currency    Currencies expected        (e.g. HKD, JPY)
+
+Save the file.
+
+NOTE: The "File" value must match the PDF filename in input/
+      exactly, including the .pdf extension.
+
+
+================================================================
+STEP 2 — RUN create_config_json.py
+================================================================
+
+Purpose: convert config.csv into config.json.
+
+Command:
+
+    python create_config_json.py
+
+Expected output:
+
+    Input : ...\config\config.csv
+    Output: ...\config\config.json
+    ------------------------------------------------------------
+    Wrote ...\config\config.json
+
+    Parsed config:
+      'Bank': 'hsbc'
+      'Style': 'hsbc_hk'
+      'File': 'HSBC_full_hk.pdf'
+      ...
+
+If the output shows [FAILED], fix the CSV and run again.
+Common cause: missing "key,value" header row, or a blank key.
+
+
+================================================================
+STEP 3 — RUN read_pdf.py
+================================================================
+
+Purpose: extract text from the PDF in input/.
+
+Command:
+
+    python read_pdf.py
+
+What it does:
+    - Detects whether the PDF is digital or scanned.
+    - Digital: reads text directly (fast).
+    - Scanned: renders pages and runs OCR (slower, 8 pages at a
+      time in parallel).
+    - Writes two files to output/:
+        <pdf_stem>_tesseract.txt   the extracted text
+        <pdf_stem>_meta.json       extraction metadata
+
+Expected output (scanned example):
+
+    2025_03_HSBC.pdf is "scanned" (avg 0.0 chars/page over
+    2/2 pages, threshold 50; per-page=[0, 0])
+    Extracted 44465 chars from 29 page(s) via tesseract.
+    sha256=fce26f2c...
+    Text written to ...\output\HSBC_full_hk_tesseract.txt
+    Meta written to ...\output\HSBC_full_hk_meta.json
+
+If [FAILED] appears, the cause is printed. Common causes:
+    - PDF not found in input/
+    - Tesseract not installed or not on PATH
+    - PDF is password-protected
+
+
+================================================================
+STEP 4 — RUN txt_to_json_API.py
+================================================================
+
+Purpose: send the OCR text to DeepSeek and save the response.
+
+Command:
+
+    python txt_to_json_API.py
+
+What it does:
+    - Splits the OCR text into per-statement chunks.
+    - Calls DeepSeek once per statement.
+    - Writes one JSON file per statement to output/json/.
+
+Expected output:
+
+    Style   : ...\config\styles\hsbc_hk.txt (18845 chars)
+    OCR text: ...\output\HSBC_full_hk_tesseract.txt (44465 chars)
+    Split   : 22 statement(s) found
+      statement 1: 1362 chars
+      statement 2: 1617 chars
+      ...
+    API key : loaded from ...\key (sk-4243...0fcb)
+
+    --- Statement 1/22 ---
+      Prompt: 10560 chars (~3520 tokens est.)
+      [debug] finish_reason=stop
+      [debug] content length=4231
+      ...
+      Saved: ...\output\json\HSBC_full_hk_stmt1.json
+
+    --- Statement 2/22 ---
+      ...
+
+    ============================================================
+    Summary: 21/22 statements saved
+      OK  HSBC_full_hk_stmt1.json
+      ...
+      FAILED  statement 14
+
+Time: roughly 20-30 seconds per statement.
+Cost: a few cents (RMB) per statement.
+
+If a statement fails:
+    - The rest continue.
+    - The summary at the end lists which failed.
+    - Re-run the program to retry (already-saved files are
+      overwritten). Cost is minimal.
+
+
+================================================================
+STEP 5 — RUN json_to_csv.py
+================================================================
+
+Purpose: convert the JSON responses into final CSV files.
+
+Command:
+
+    python json_to_csv.py
+
+What it does:
+    - Reads every JSON in output/json/.
+    - Cleans numeric fields (removes thousands separators).
+    - Inserts two blank reserve columns after "balance".
+    - Merges CSVs that share a filename.
+    - Writes the final CSVs to output/csv/.
+
+Expected output:
+
+    JSON dir: ...\output\json
+    CSV  dir: ...\output\csv
+    Reserve : ['reserve_col_1', 'reserve_col_2'] after 'balance'
+    ------------------------------------------------------------
+    Found 21 JSON file(s):
+      HSBC_full_hk_stmt1.json
+      ...
+
+    Merging CSV content by filename...
+      ...
+
+    Writing 5 CSV file(s):
+      wrote hsbc_147-780480-838_HKD_savings_2024-2025.csv
+      wrote hsbc_147-780480-838_JPY_savings_2024-2025.csv
+      wrote hsbc_147-780480-838_total_verification_2024-2025.csv
+      wrote hsbc_147-780480-838_cross_month_continuity_2024-2025.csv
+      wrote hsbc_147-780480-838_net_movement_2024-2025.csv
+
+    ============================================================
+    Done. 5 CSV file(s) in ...\output\csv
+
+This step is free and instant. Re-run it as often as you like.
+
+
+================================================================
+FINAL RESULT
+================================================================
+
+Open output/csv/. You will find:
+
+    <bank>_<account>_<ccy>_<type>_<period>.csv
+        The main transaction list. This is what you use for
+        accounting work.
+
+    <bank>_<account>_total_verification_<period>.csv
+        Cross-check of deposit and withdrawal counts and totals
+        against the printed statement summary.
+
+    <bank>_<account>_cross_month_continuity_<period>.csv
+        Prior month closing vs next month opening. All "match"
+        values should be True.
+
+    <bank>_<account>_net_movement_<period>.csv
+        Monthly opening + deposits - withdrawals vs closing.
+
+Open the main transaction CSV in Excel. Check:
+    - Dates are in ascending order.
+    - Amounts have no thousands separators.
+    - The "verify_row" column shows the arithmetic check for
+      each row.
+    - Two empty columns ("reserve_col_1", "reserve_col_2") are
+      present for your manual notes.
+
+
+================================================================
+COMMON PROBLEMS AND QUICK FIXES
+================================================================
+
+Problem: create_config_json.py reports [FAILED]
+Fix:     Check config.csv has a header row "key,value".
+         Check no key is blank.
+
+Problem: read_pdf.py reports "PDF not found"
+Fix:     Check the File value in config.csv matches the exact
+         filename in input/, including the .pdf extension.
+
+Problem: read_pdf.py reports "Tesseract binary not found"
+Fix:     Install Tesseract (see Step 0B). On Windows, edit
+         read_pdf.py and confirm the tesseract_cmd line points
+         to the correct path.
+
+Problem: txt_to_json_API.py reports "DEEPSEEK_API_KEY is not set"
+Fix:     This project reads the key from key/<Key_file>, not
+         from an environment variable. Check that config.csv
+         has Key_file set correctly, and that the named file
+         exists in key/.
+
+Problem: txt_to_json_API.py says "No statement marker found"
+Fix:     The OCR text does not contain the string
+         "HSBC Business Direct Statement". Either the PDF is
+         not an HSBC statement, or the OCR misread the header.
+         Open the OCR text file and search for "HSBC".
+
+Problem: A statement shows finish_reason=length
+Fix:     The statement is too large for one API call. The
+         response is truncated. Options: split the statement
+         further by page, or accept the partial result and
+         correct manually.
+
+Problem: json_to_csv.py reports "[WARN] missing statement number"
+Fix:     One or more statements failed in Step 4. Re-run
+         txt_to_json_API.py to retry them. The missing
+         statements are listed.
+
+Problem: A CSV row has the wrong number of columns
+Fix:     DeepSeek emitted a numeric field with a thousands
+         separator that was not quoted. Check the source JSON
+         for that row. The long-term fix is to strengthen the
+         numeric rules in the style file or system prompt.
+
+
+================================================================
+WHEN TO UPDATE THE STYLE FILE
+================================================================
+
+config/styles/hsbc_hk.txt contains the parsing rules for HSBC
+Hong Kong statements. Update it when:
+
+    - You spot a recurring error in the CSV output that the
+      model keeps making.
+    - HSBC changes its statement layout.
+    - You want to add a new column or change the output format.
+
+After editing the style file, re-run Step 4 (the API call) and
+Step 5 (the conversion). The style file is read fresh on every
+API call.
+
+When you change the style file, update its version number at
+the top of the file.
+
+
+================================================================
+WHEN TO UPDATE config.csv
+================================================================
+
+Every time you process a new PDF:
+    - Change File to the new PDF filename.
+    - Change Page_start and Page_end to match the new PDF.
+
+When you switch banks:
+    - Change Bank and Style to the new bank's identifiers.
+    - Create a new config/styles/<newstyle>.txt first.
+
+When you change the DeepSeek key:
+    - Replace the contents of key/deepseek_key.txt.
+    - No other change needed.
+
+
+================================================================
+FILES YOU SHOULD BACK UP
+================================================================
+
+    config/styles/*.txt      Your parsing rules. Valuable.
+    config/config.csv        Your current settings.
+    key/deepseek_key.txt     Your API key. Keep secret.
+
+The following can be regenerated at any time and do not need
+backup:
+    config/config.json
+    output/*.txt
+    output/*_meta.json
+    output/json/*.json
+    output/csv/*.csv
+
+
+================================================================
+SUMMARY — THE FIVE COMMANDS
+================================================================
+
+Every time you process a batch:
+
+    python create_config_json.py
+    python read_pdf.py
+    python txt_to_json_API.py
+    python json_to_csv.py
+
+Four commands, in order. Then open output/csv/.
+
+
+================================================================
+END OF HOWTO
+================================================================

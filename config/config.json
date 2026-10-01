@@ -1,0 +1,17 @@
+{
+  "Bank": "hsbc",
+  "Style": "hsbc_hk",
+  "File": "2025_10_HSBC.pdf",
+  "Language": [
+    "English",
+    "Chinese"
+  ],
+  "Page_start": "1",
+  "Page_end": "12",
+  "Currency": [
+    "HKD",
+    "JPY"
+  ],
+  "Key_file": "deepseek_key.txt",
+  "Statement_marker": "HSBC Business Direct Statement"
+}

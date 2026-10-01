@@ -1,0 +1,361 @@
+================================================================
+MODULE 2 — DEEPSEEK API CONNECTOR
+Specification v1
+Version: 2026.10.01
+Last updated: 2026-10-01
+================================================================
+
+PURPOSE
+-------
+Module 2 reads config.json + a natural-language style instruction
+file + the OCR text produced by Module 1, sends them to DeepSeek,
+and saves the raw JSON response for Module 3.
+
+The design principle:
+    The intelligence lives in the style text file, not in Python.
+    Bank layouts are not structurally uniform (e.g. one HSBC
+    account number can carry both HKD and JPY sub-accounts), so
+    rigid JSON schemas fail. Natural-language instructions to
+    DeepSeek handle the variation better.
+
+STATUS AFTER TESTING
+--------------------
+- Working end-to-end on 29-page HSBC Business Direct statements.
+- Split into 22 statement chunks; 21 succeeded on first pass.
+- One statement (stmt14) failed and was skipped by Module 3.
+- Numeric formatting issue (ISSUE-001) resolved by moving
+  numeric rules into the system prompt.
+- Result quality approximately 99.0-99.5%. Minor manual
+  corrections still needed.
+
+
+================================================================
+1. INPUTS AND OUTPUTS
+================================================================
+
+INPUTS:
+    config/config.json
+        Keys used by this module:
+            Bank, Style, File, Key_file, Language,
+            Page_start, Page_end, Currency
+
+    config/styles/<Style>.txt
+        Natural-language instruction file, e.g. hsbc_hk.txt.
+        This is the single source of parsing rules.
+
+    output/<pdf_stem>_tesseract.txt   (or _pdfplumber.txt)
+        The OCR text produced by Module 1.
+
+    key/<Key_file>
+        Text file containing the DeepSeek API key, one line.
+
+OUTPUTS:
+    output/json/<pdf_stem>_stmt<N>.json
+        One file per statement chunk.
+        Each contains:
+            {
+              "files": [
+                {"filename": "...csv", "content": "...\n...\n..."},
+                ...
+              ],
+              "warnings": [...]
+            }
+
+
+================================================================
+2. OVERALL FLOW
+================================================================
+
+    config.json + style.txt + OCR text
+       |
+       v
+   [load_config]         (json.load)
+       |
+       v
+   [load_style_text]     (read config/styles/<Style>.txt)
+       |
+       v
+   [locate_ocr_text]     (find output/<stem>_*.txt)
+       |
+       v
+   [split_by_statement]  (split on "HSBC Business Direct Statement")
+       |
+       v
+   For each statement chunk:
+       |
+       v
+   [build_messages]      (system prompt + user prompt)
+       |
+       v
+   [call_deepseek]       (OpenAI SDK, retries, JSON mode)
+       |
+       v
+   [save_raw_response]   (validate JSON, write to output/json/)
+
+
+================================================================
+3. CONFIGURATION
+================================================================
+
+DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+DEEPSEEK_MODEL    = "deepseek-flash"
+MAX_TOKENS        = 8000
+TEMPERATURE       = 0
+MAX_RETRIES       = 5
+RETRY_BACKOFF_BASE = 2
+STATEMENT_MARKER  = "HSBC Business Direct Statement"
+
+API key:
+    Read from key/<Key_file>. The Key_file value comes from
+    config.json. The file should contain a single line with the
+    raw key starting with "sk-".
+
+    Do NOT use environment variables for this project, to keep
+    configuration in one place. Do NOT commit key/ to version
+    control.
+
+
+================================================================
+4. STATEMENT SPLITTING
+================================================================
+
+Function:
+    split_by_statement(ocr_text, marker) -> list[str]
+
+Method:
+    Split the OCR text on the marker. Each chunk starts with the
+    marker and ends just before the next occurrence. Text before
+    the first marker is discarded.
+
+Why:
+    A single PDF may contain many statements. Sending the whole
+    OCR text to DeepSeek in one call produces output that exceeds
+    MAX_TOKENS and gets truncated (finish_reason=length, content
+    empty or partial). Splitting keeps each call's output under
+    the budget.
+
+Observed behaviour on a 29-page HSBC file:
+    22 statement chunks, each 1300-2800 chars.
+    Each API call: prompt ~10000-11000 tokens, output ~2000-4000
+    tokens. Well within MAX_TOKENS=8000.
+
+If a single statement still exceeds the budget:
+    Split further by page. Not implemented yet.
+
+
+================================================================
+5. PROMPT CONSTRUCTION
+================================================================
+
+Function:
+    build_messages(style_text, statement_text, cfg)
+        -> list[dict[str, str]]
+
+Structure:
+    Two messages: system + user.
+
+SYSTEM PROMPT — contents (in order):
+    1. Role: "bank statement parsing assistant for a Hong Kong CPA"
+    2. Output format (the JSON envelope with "files" and "warnings")
+    3. NUMERIC FORMATTING — MANDATORY
+         - Period as decimal mark
+         - NO thousands separators
+         - NO currency symbol
+         - Positive and negative examples
+         - Applies to every numeric field in every CSV
+         - Explicitly covers verify_row and remark columns
+    4. HEADER ROW — reminder that CSV header must match the style
+       file exactly, in column order
+
+Why numeric rules are in the system prompt (not just the style
+file):
+    - The style file is long (18845 chars in the current version)
+      and rules embedded in section 7.2 are easily missed.
+    - Models follow system instructions more reliably than user
+      instructions.
+    - Positive and negative examples dramatically reduce
+      compliance failures.
+    This was the fix for ISSUE-001.
+
+USER PROMPT — contents (in order):
+    1. Task context block (Bank, Style, File, Language,
+       Page_start, Page_end, Currency)
+    2. Style instruction file (full text)
+    3. OCR text for one statement
+    4. Reminder (at the end, exploiting recency):
+         - "NO thousands separators"
+         - "verify_row: NO thousands separators"
+         - "CSV header exactly as specified"
+
+Why the reminder at the end:
+    Models weigh the beginning and end of long prompts most
+    heavily. Critical formatting rules appear in both places.
+
+
+================================================================
+6. API CALL
+================================================================
+
+Function:
+    call_deepseek(client, messages, max_retries=5) -> str
+
+Request parameters:
+    model         = DEEPSEEK_MODEL
+    messages      = messages
+    temperature   = 0
+    max_tokens    = MAX_TOKENS
+    response_format = {"type": "json_object"}
+    extra_body    = {"thinking": {"type": "disabled"}}
+
+Why temperature=0:
+    Deterministic output for financial data.
+
+Why response_format json_object:
+    Guarantees the response is syntactically valid JSON. Content
+    correctness is still the model's responsibility.
+
+Why thinking disabled:
+    The thinking mode consumes the entire max_tokens budget on
+    internal reasoning and never produces content, resulting in
+    finish_reason=length with an empty content string. This was
+    observed consistently on large inputs. Disabling thinking
+    restored normal behaviour.
+
+RETRY POLICY:
+    Retry on:
+        RateLimitError          (429)
+        APIConnectionError      (network failure)
+        APIError with status >= 500
+        Empty or whitespace-only content
+    Do NOT retry on:
+        APIError with 4xx other than 429
+        finish_reason == "length" with partial content
+            (return the partial content with a warning)
+
+Backoff:
+    2 ** attempt seconds (2, 4, 8, 16, 32).
+
+Diagnostics printed on every response:
+    finish_reason
+    content length
+    reasoning_content length (if returned)
+    usage: prompt_tokens, completion_tokens, total_tokens
+    reasoning_tokens (if returned)
+
+
+================================================================
+7. OUTPUT
+================================================================
+
+Function:
+    save_raw_response(raw, pdf_name, stmt_no) -> Path
+
+Behaviour:
+    - Validate raw string as JSON before writing.
+    - If invalid, raise Module2Error with the first 500 chars.
+    - If valid, pretty-print (indent=2, ensure_ascii=False) and
+      write to output/json/<pdf_stem>_stmt<N>.json.
+
+Filename convention:
+    <pdf_stem>_stmt<N>.json
+    Example: HSBC_full_hk_stmt1.json .. HSBC_full_hk_stmt22.json
+
+Why one file per statement:
+    - Allows Module 3 to process each independently.
+    - Allows re-running Module 3 without re-calling the API.
+    - A single statement failure does not lose the other 21.
+
+
+================================================================
+8. MAIN LOOP
+================================================================
+
+Steps:
+    1. Load config.json.
+    2. Load style text.
+    3. Locate OCR text file.
+    4. Split OCR text by statement marker.
+    5. Print statement count and per-statement char counts.
+    6. Load API key from key/<Key_file>.
+    7. Create OpenAI client with base_url = DEEPSEEK_BASE_URL.
+    8. For each statement chunk:
+         a. Build messages.
+         b. Print prompt size (chars and estimated tokens).
+         c. Call DeepSeek with retries.
+         d. Save response to output/json/.
+         e. On failure, record statement number and continue.
+    9. Print summary: <saved>/<total> statements saved,
+       and list any failed statement numbers.
+    10. Return 0 if all succeeded, 1 if any failed.
+
+Exit codes:
+    0  all statements processed
+    1  config error, OCR text missing, split failed, or any
+       statement failed after retries
+
+
+================================================================
+9. FAILURE POLICY
+================================================================
+
+STOP and raise on:
+    - config.json missing or invalid
+    - Style file missing
+    - OCR text file missing
+    - API key file missing or empty
+    - OCR text does not contain the statement marker
+    - All statements failed
+
+WARN and continue on:
+    - One or more statements failed (recorded, summary printed)
+    - Response truncated (partial content returned with warning)
+    - Key does not start with "sk-"
+
+Never silently discard a failed statement. The summary must
+list which statements were not saved.
+
+
+================================================================
+10. KNOWN LIMITATIONS
+================================================================
+
+1. Statement splitting depends on a fixed marker string.
+   Banks with different headers need per-bank markers. Future:
+   read the marker from the style file or a separate config key.
+
+2. If a single statement's output exceeds MAX_TOKENS=8000, it
+   is truncated and cannot be recovered. Future: split by page.
+
+3. The API may occasionally return an empty content even with
+   thinking disabled. The retry loop handles this.
+
+4. Numeric formatting compliance is high but not perfect after
+   the ISSUE-001 fix. Module 3 provides a client-side safety
+   net (sanitize_csv_content).
+
+5. Statement 14 (in the 29-page test) failed. Cause not yet
+   diagnosed. Future: log the raw response for failed
+   statements so the cause can be inspected.
+
+
+================================================================
+11. IMPROVEMENT IDEAS FOR FUTURE VERSIONS
+================================================================
+
+- Move the statement marker into config.json so that different
+  banks can specify their own split point.
+- Add a per-statement timeout so one slow call cannot stall
+  the whole batch.
+- Log failed responses to output/json/_failed/ for diagnosis.
+- Parallelise API calls across statements. The API rate limit
+  and cost make this less attractive than it sounds; serial is
+  simpler and easier to audit.
+- Add a dry-run mode that prints the prompt without calling
+  the API, for prompt-engineering iteration.
+- Add a "resume" mode that skips statements whose JSON file
+  already exists, to avoid re-spending tokens on success.
+
+
+================================================================
+END OF SPECIFICATION
+================================================================

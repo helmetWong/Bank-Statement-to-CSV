@@ -1,0 +1,400 @@
+================================================================
+MODULE 3 — JSON TO CSV WRITER
+Specification v2
+Version: 2026.10.01
+Last updated: 2026-10-01
+Supersedes: module3_json_to_csv_spec_v1.txt
+================================================================
+
+CHANGES FROM v1
+---------------
+1. Reserve columns added. Two blank columns, named
+   "reserve_col_1" and "reserve_col_2", are inserted
+   immediately after the "balance" column and before "remark".
+   They are placeholders for manual use (category, tax code,
+   audit note, client reference, etc.) and are left empty by
+   the pipeline.
+
+2. New function inject_reserve_columns() added.
+
+3. Process order documented: sanitize_csv_content() runs
+   first (sees the original column layout), then
+   inject_reserve_columns() runs.
+
+4. Reserve columns apply to every CSV that passes through
+   process_json_files(). This includes the main transaction
+   files and the verification files, unless a future version
+   adds a filename filter.
+
+STATUS AFTER TESTING
+--------------------
+- Working. Merges 21 (or 22) statement JSON files into 5 CSV
+  files, each with the two reserve columns present.
+- Client-side numeric sanitization applied (fixes part of
+  ISSUE-001).
+- Missing-statement warning added; reported the stmt14 gap
+  cleanly.
+- Result: approximately 99.0-99.5% accurate. Minor manual
+  corrections remain.
+
+
+================================================================
+PURPOSE
+-------
+Module 3 reads the JSON envelope files produced by Module 2
+and writes their embedded CSV content to output/csv/. Pure
+local file operation. No API calls. Re-runnable.
+
+Design principle:
+    Separate the API call (expensive, slow) from the file
+    conversion (free, instant). Iterate on CSV format without
+    re-spending tokens.
+
+
+================================================================
+1. INPUTS AND OUTPUTS
+================================================================
+
+INPUTS:
+    output/json/<pdf_stem>_stmt<N>.json
+    Each file contains:
+        {
+          "files": [
+            {"filename": "...csv", "content": "...\n...\n..."},
+            ...
+          ],
+          "warnings": [...]
+        }
+
+OUTPUTS:
+    output/csv/<filename>.csv
+    Files from different statements with the same filename are
+    merged: their rows concatenated under one header.
+
+    Encoding: utf-8-sig (BOM included so Excel on Windows/HK
+    opens Chinese characters correctly).
+
+
+================================================================
+2. OVERALL FLOW
+================================================================
+
+    output/json/*.json
+       |
+       v
+   [find_json_files]          (glob, sort by stmt number)
+       |
+       v
+   [check_missing_statements] (gap detection, warning only)
+       |
+       v
+   For each JSON file:
+       |
+       v
+   [load_json]                (validate "files" key)
+       |
+       v
+   [sanitize_csv_content]     (clean numerics, re-emit via
+                               csv.writer)
+       |
+       v
+   [inject_reserve_columns]   (insert 2 blank columns after
+                               "balance")
+       |
+       v
+   [merge_csv_content]        (concatenate blocks, one header)
+       |
+       v
+   [write_csv_files]          (write each merged CSV)
+
+
+================================================================
+3. RESERVE COLUMNS (NEW IN v2)
+================================================================
+
+3.1 PURPOSE
+    Two blank columns for manual use. Examples of future use:
+        - Category / account code
+        - Tax code
+        - Client reference
+        - Audit note
+        - Reconciliation flag
+
+    In v2 they are always empty strings. The pipeline does not
+    populate them.
+
+3.2 POSITION
+    Inserted immediately after the anchor column, which is
+    "balance" by default:
+
+        ... deposit, withdrawal, balance,
+            reserve_col_1, reserve_col_2,
+            remark, verify_row
+
+    Placing them after "balance" keeps the balance column
+    position stable for Excel formulas that reference it by
+    column letter.
+
+3.3 CONFIGURATION
+    Two module-level constants:
+
+        RESERVE_COLUMNS = ["reserve_col_1", "reserve_col_2"]
+        RESERVE_INSERT_AFTER = "balance"
+
+    To rename the columns when their purpose becomes clear:
+
+        RESERVE_COLUMNS = ["account_code", "client_ref"]
+
+    To move them elsewhere (e.g. after "verify_row"):
+
+        RESERVE_INSERT_AFTER = "verify_row"
+
+    Both changes take effect on the next run of Module 3. No
+    API call, no Module 2 re-run, no JSON regeneration needed.
+
+3.4 INJECTION RULES
+    inject_reserve_columns(content) -> str
+
+    - If the reserve columns already exist in the header
+      (e.g. DeepSeek emitted them), the content is returned
+      unchanged to avoid duplication.
+    - If the anchor column is not found, the content is
+      returned unchanged with a warning.
+    - Every data row gets empty strings at the reserve
+      positions.
+
+3.5 ORDER RELATIVE TO SANITIZATION
+    Sanitization runs first, on the original column layout.
+    Injection runs second. Reversing the order would cause
+    the numeric cleaner to see two extra empty columns that
+    it does not expect, and column-count warnings would fire
+    on every row.
+
+3.6 SCOPE
+    Reserve columns are injected for every CSV that passes
+    through process_json_files(). This means the main
+    transaction files AND the verification files
+    (total_verification, cross_month_continuity,
+    net_movement) all receive the two columns.
+
+    If in future you want them only in the transaction files,
+    add a filename filter inside process_json_files() before
+    calling inject_reserve_columns().
+
+
+================================================================
+4. NUMERIC SANITIZATION (FIX FOR ISSUE-001)
+================================================================
+
+Function:
+    sanitize_csv_content(content: str) -> str
+
+Method:
+    1. Parse the raw CSV string using csv.reader.
+    2. For each data row, apply _clean_number to every field.
+    3. Re-emit using csv.writer with QUOTE_MINIMAL and
+       lineterminator="\n".
+    4. If any row's field count differs from the header,
+       print a warning.
+
+Function:
+    _clean_number(s: str) -> str
+
+Method:
+    - Strip whitespace.
+    - Normalise full-width comma (U+FF0C) to half-width.
+    - If the normalised string matches
+        ^\d{1,3}(,\d{3})+(\.\d+)?$
+      remove all commas.
+    - Otherwise return the original string unchanged.
+
+Why:
+    DeepSeek occasionally emits numbers with thousands
+    separators (e.g. "960,000.00") despite the system prompt
+    rule. Unquoted, a comma splits the CSV field. The
+    sanitizer:
+      - removes the separator when the value is quoted
+      - re-emits with proper quoting so any remaining comma
+        cannot split a field
+      - preserves commas in non-numeric fields (names, etc.)
+
+Known limitation:
+    If DeepSeek writes "960,000.00" UNQUOTED, the CSV reader
+    already split it into two fields before sanitization runs.
+    The sanitizer cannot un-split these. Only the prompt-level
+    fix in Module 2 prevents this case.
+
+
+================================================================
+5. FILE DISCOVERY
+================================================================
+
+Function:
+    find_json_files(json_dir) -> list[Path]
+
+    glob("*_stmt*.json") in output/json/, sorted by
+    (pdf_stem, statement_number).
+
+Function:
+    _stmt_sort_key(path) -> (str, int)
+
+    Parses "<base>_stmt<N>" into ("<base>", N). Falls back to
+    (stem, 0) if the pattern is absent.
+
+Function:
+    check_missing_statements(json_files) -> list[int]
+
+    - If fewer than 2 files, or multiple PDF stems present,
+      return [] (no gap can be inferred).
+    - Otherwise compute the observed range [min..max] and
+      return the missing numbers as a sorted list.
+
+Behaviour:
+    Informational only. The program continues even with gaps.
+    A prominent warning block is printed in the terminal.
+
+
+================================================================
+6. MERGING
+================================================================
+
+Function:
+    merge_csv_content(existing, new_content) -> str
+
+Method:
+    - Keep the header from the first block.
+    - For subsequent blocks, drop the header and append rows.
+    - If headers differ, print a warning.
+
+Why:
+    Each statement produces CSVs with the same filename (e.g.
+    hsbc_123-XXXXXX-001_HKD_savings_2024-2025.csv).
+    Concatenating under one header produces a single file for
+    the whole period.
+
+Known limitations:
+    - Transactions that appear in two adjacent statements
+      (overlapping months) will appear twice.
+    - "end of month" remarks appear wherever the model placed
+      them in each statement's output, not necessarily at the
+      actual month boundary.
+    - Rows are not re-sorted by date after merging.
+    These are deferred until the input data shows they matter.
+
+
+================================================================
+7. WRITING
+================================================================
+
+Function:
+    write_csv_files(merged, csv_dir) -> list[Path]
+
+Behaviour:
+    - Create output/csv/ if missing.
+    - Write each file with encoding="utf-8-sig".
+    - Print filename, line count, char count per file.
+
+Encoding note:
+    utf-8-sig writes a BOM at the start of the file. Excel
+    on Windows treats this as a signal to use UTF-8, which is
+    required for Chinese characters to display correctly.
+
+
+================================================================
+8. MAIN
+================================================================
+
+Steps:
+    1. Locate output/json/ and output/csv/.
+    2. Print reserve-column configuration for confirmation.
+    3. Find JSON files.
+    4. Print file list.
+    5. Check for missing statement numbers; warn if any.
+    6. Read, sanitize, inject reserve columns, merge.
+    7. Write merged CSVs to output/csv/.
+    8. Print summary.
+
+Exit codes:
+    0  success (even with gap warnings)
+    1  no JSON files found, invalid JSON, or no CSV content
+
+
+================================================================
+9. FAILURE POLICY
+================================================================
+
+STOP and raise on:
+    - output/json/ missing
+    - No *_stmt*.json files found
+    - A JSON file cannot be parsed
+    - A JSON file lacks the "files" array
+    - No CSV content found in any JSON file
+
+WARN and continue on:
+    - Missing statement numbers
+    - Header mismatch while merging
+    - Row with wrong column count
+    - Malformed entry in a JSON's "files" array
+    - Anchor column not found for reserve injection
+
+
+================================================================
+10. AUDIT TRAIL
+================================================================
+
+Module 3 does not write its own sidecar file. The audit
+information lives in:
+    - The source JSON files (DeepSeek's raw output).
+    - Module 1's output/<pdf_stem>_meta.json.
+    - Module 2's terminal output.
+
+Future improvement:
+    Write output/csv/_summary.json listing:
+        - Which JSON files were merged
+        - Which statements were missing
+        - Per-file row counts
+        - Per-file header
+        - Reserve column names and position
+
+
+================================================================
+11. KNOWN LIMITATIONS
+================================================================
+
+1. Cannot un-split numbers that DeepSeek emitted unquoted
+   with thousands separators. The prompt fix in Module 2 is
+   the real remedy.
+2. No date sorting after merge.
+3. No deduplication for overlapping month boundaries.
+4. No recomputation of "end of month" remarks after merge.
+5. Column-count warnings are printed but not collected into
+   a report file.
+6. Reserve columns are always empty. No mechanism yet to
+   populate them from a lookup table or manual input file.
+
+
+================================================================
+12. IMPROVEMENT IDEAS FOR FUTURE VERSIONS
+================================================================
+
+- Sort merged rows by the date column after merging.
+- Deduplicate on (date, details_eng, deposit, withdrawal,
+  balance) to remove overlap duplicates.
+- Recompute "end of month" remarks: find the last row of
+  each calendar month per currency and ensure the remark
+  is present.
+- Write a _summary.json sidecar per run.
+- Optionally emit a pipe-delimited version alongside the
+  CSV, for tools that dislike quoted fields.
+- Add a validation mode that checks running-balance
+  arithmetic across the merged file.
+- Add a mechanism to populate reserve columns from a
+  separate mapping file (e.g. category code by payee name).
+- Rename reserve columns to their real purpose once known.
+- Optional: restrict reserve injection to transaction files
+  only, via a filename filter.
+
+
+================================================================
+END OF SPECIFICATION
+================================================================

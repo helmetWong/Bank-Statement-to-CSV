@@ -1,0 +1,14 @@
+project/
+├── specs/
+│   ├── 00_master_overview.txt
+│   ├── module1_extract_spec_v3.txt
+│   ├── module2_api_spec_v1.txt
+│   └── module3_json_to_csv_spec_v1.txt
+├── config/
+├── key/
+├── input/
+├── output/
+├── utilities.py
+├── read_pdf.py
+├── txt_to_json_API.py
+└── json_to_csv.py

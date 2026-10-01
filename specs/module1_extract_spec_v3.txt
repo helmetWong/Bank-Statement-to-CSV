@@ -1,0 +1,457 @@
+================================================================
+MODULE 1 — PDF TEXT EXTRACTION
+Specification v3
+Version: 2026.10.01
+Last updated: 2026-10-01
+Supersedes: module1_extract_spec_v2.txt (2026-09-30)
+================================================================
+
+CHANGES FROM v2
+---------------
+1. Parallel scanned-page processing via ThreadPoolExecutor.
+   Threads (not processes) because the bottleneck is the external
+   Tesseract subprocess and the GIL is released while waiting.
+
+2. OCR_WORKERS constant added (default 8). Tunable per machine.
+   For a 24-core machine, 8 is the recommended starting point.
+
+3. Result order preserved by tagging each page with its number,
+   then sorting before joining.
+
+4. Module version bumped to reflect parallel execution and
+   documented on the module header.
+
+STATUS AFTER TESTING
+--------------------
+- Digital path: working.
+- Scanned path (Tesseract only): working.
+- DeepSeek Vision for handwriting: deferred (still not implemented).
+- Tested on a 2-page scanned HSBC statement: 2981 chars, clean meta.
+- Tested on a 29-page scanned HSBC statement: 44465 chars, split
+  successfully downstream into 22 statements.
+- One known limitation: OCR quality varies. Downstream Module 2
+  relies on DeepSeek to reconstruct table structure from noisy text.
+
+
+================================================================
+PURPOSE
+-------
+Turn a PDF bank statement into structured text ready for Module 2.
+Handles two input types:
+
+    (a) DIGITAL PDF  — text layer present, downloaded from bank
+                       online banking. Fast, free, high accuracy.
+
+    (b) SCANNED PDF  — images only, possibly with handwritten
+                       annotations added before scanning. Slower,
+                       costs OCR time, needs preprocessing.
+
+Design principle:
+    Detect first, then route.
+    Never run OCR on a digital PDF.
+    Never trust OCR on handwriting without a validation layer.
+
+
+================================================================
+1. OUTPUT CONTRACT
+================================================================
+
+Module 1 returns a dict:
+
+{
+  "pdf_path":    "/path/to/statement.pdf",
+  "pdf_type":    "digital" | "scanned",
+  "text":        "<full extracted text, printed content>",
+  "handwriting": "<separate handwritten text>" | None,
+  "page_count":  <int>,
+  "extraction_meta": {
+      "engine":    "pdfplumber" | "tesseract",
+      "warnings":  [ ... ],
+      "detection": {
+          "pages_sampled":      <int>,
+          "per_page_chars":     [<int>, ...],
+          "avg_chars_per_page": <float>,
+          "threshold":          <int>,
+          "total_pages":        <int>
+      },
+      "sha256":    "<hash of the source PDF>",
+      "ocr_lang":  "eng+chi_tra" | None,
+      "dpi":       300 | None
+  }
+}
+
+Notes:
+- "handwriting" is always None in the current version. Reserved
+  for a future DeepSeek Vision path.
+- "engine" names the extractor actually used. "tesseract" covers
+  the scanned path even though PyMuPDF performed the rendering.
+- "ocr_lang" and "dpi" are populated only for scanned PDFs.
+
+
+================================================================
+2. OVERALL FLOW
+================================================================
+
+    PDF file
+       |
+       v
+   [detect_pdf_type]     (pdfplumber, sample 3 pages)
+       |
+       +-- DIGITAL --> [extract_digital_text]   --> done
+       |                 (pdfplumber, layout=True)
+       |
+       +-- SCANNED --> [render_pages_to_images]  (PyMuPDF)
+                            |
+                            v
+                      [check_image_quality]     (skip blank/dark)
+                            |
+                            v
+                      [preprocess_for_ocr]      (PIL)
+                            |
+                            v
+                      [run_tesseract]           (pytesseract)
+                            |
+                            v
+                      [merge_results]           --> done
+                            (parallel via ThreadPoolExecutor)
+
+
+================================================================
+3. LAYER 1 — PDF TYPE DETECTION
+================================================================
+
+Do NOT blindly OCR. First check whether the PDF has a usable
+text layer.
+
+Method:
+    1. Open with pdfplumber.
+    2. Sample the first min(3, total_pages) pages.
+    3. Extract text from each sampled page.
+    4. Compute average characters per page.
+    5. If average > 50 chars/page -> DIGITAL.
+       Else                       -> SCANNED.
+
+Threshold rationale:
+    - Digital statements typically yield 500-3000 chars/page.
+    - Scanned PDFs yield 0 chars or a tiny amount of boilerplate.
+    - 50 is safely between the two populations.
+
+Function signature:
+    detect_pdf_type(pdf_path) -> (pdf_type: str, diagnostics: dict)
+
+The diagnostics dict is preserved and passed into extraction_meta
+for audit purposes.
+
+Edge case:
+    Hybrid PDFs (some pages digital, some scanned) are rare.
+    This version treats the whole file as whichever type dominates.
+
+
+================================================================
+4. LAYER 2 — DIGITAL PDF EXTRACTION
+================================================================
+
+Use pdfplumber with layout preservation:
+
+    page.extract_text(layout=True)
+
+Why layout=True:
+    Bank statements are tabular. Without layout mode, pdfplumber
+    collapses columns and rows into a single stream, destroying
+    the alignment between Date | Description | Debit | Credit |
+    Balance. layout=True keeps whitespace-based column structure,
+    which improves DeepSeek's ability to reconstruct the table.
+
+Page separator:
+    Pages are joined with:
+        "\n\n--- PAGE BREAK ---\n\n"
+
+What NOT to do:
+    - Do NOT run OCR on digital PDFs.
+    - Do NOT strip newlines or collapse whitespace.
+
+Function signature:
+    extract_digital_text(pdf_path) -> str
+
+
+================================================================
+5. LAYER 3 — SCANNED PDF HANDLING
+================================================================
+
+--------------------------------------------------------------
+5.1  RENDER PDF PAGES TO IMAGES
+--------------------------------------------------------------
+    dpi    = 300
+    format = RGB  (PyMuPDF pixmap -> PIL Image)
+
+    Implementation: PyMuPDF (imported as fitz).
+
+        doc = fitz.open(pdf_path)
+        for page in doc:
+            pix = page.get_pixmap(dpi=300)
+            img = Image.frombytes("RGB",
+                                  [pix.width, pix.height],
+                                  pix.samples)
+
+    Critical: doc.close() must be called in a finally block.
+    PyMuPDF holds the file handle; on Windows this prevents the
+    file from being deleted or overwritten while the process
+    is running.
+
+    Function signature:
+        render_pages_to_images(pdf_path, dpi=300) -> list[Image]
+
+--------------------------------------------------------------
+5.2  IMAGE QUALITY GUARDS
+--------------------------------------------------------------
+    Before OCR, run a cheap brightness check:
+
+        small = image.convert("L").resize((100, 100))
+        mean  = ImageStat.Stat(small).mean[0]
+
+    Skip the page and log a warning if:
+        mean > 250  -> page is nearly blank
+        mean < 20   -> page is nearly black
+
+    Do NOT use Image.Image.getdata for this. It is deprecated in
+    Pillow and removed in Pillow 14. Use ImageStat.Stat.
+
+    Width check:
+        If page width < 1500 px, warn but continue.
+
+    Function signature:
+        check_image_quality(image, page_no)
+            -> (should_skip: bool, reason: str | None)
+
+--------------------------------------------------------------
+5.3  PREPROCESS FOR OCR
+--------------------------------------------------------------
+    Steps:
+        1. Grayscale       -> remove colour noise
+        2. Contrast x2.0   -> darken faint print
+        3. Median filter   -> remove speckle from scan
+        4. Sharpen         -> restore edge definition
+
+    Do NOT binarize. Adaptive binarization helps some scanners
+    and destroys others.
+
+    Function signature:
+        preprocess_for_ocr(image) -> Image
+
+--------------------------------------------------------------
+5.4  TESSERACT OCR (printed content)
+--------------------------------------------------------------
+    Language: "eng+chi_tra"
+    PSM mode: 6  ("assume a single uniform block of text")
+
+    Function signature:
+        run_tesseract(image, lang="eng+chi_tra", psm=6) -> str
+
+    Failure modes:
+        TesseractNotFoundError -> raise PdfError with clear
+            message pointing to installation.
+        TesseractError         -> raise PdfError with the
+            original message.
+
+--------------------------------------------------------------
+5.5  MERGE SCANNED RESULTS (PARALLEL)
+--------------------------------------------------------------
+    Pages are processed in parallel using ThreadPoolExecutor.
+
+    Worker count: OCR_WORKERS = 8 (default).
+
+    Each page produces (page_no, text, skip_reason). Results
+    arrive out of order; they are sorted by page_no before
+    joining. Warnings are also sorted.
+
+    If ALL pages were skipped or empty, raise PdfError.
+
+    Return:
+        {
+            "printed_ocr": str,
+            "handwriting": None,
+            "warnings":    list[str],
+        }
+
+    Function signatures:
+        _process_one_page(page_no, raw_img)
+            -> (page_no, text | None, skip_reason | None)
+        extract_scanned_text(pdf_path, max_workers=OCR_WORKERS)
+            -> dict
+
+--------------------------------------------------------------
+5.6  DEEPSEEK VISION (handwriting) — DEFERRED
+--------------------------------------------------------------
+    Not implemented in this version.
+
+    Reason for deferral:
+        Handwriting is the rarest input in the user's workflow.
+        The printed pipeline must be proven end-to-end first.
+
+    When implemented:
+        - Handwriting must be returned in a separate field,
+          never merged with printed text.
+        - Results are UNtrusted until validated.
+        - Known limitation: DeepSeek Vision may skip lines or
+          hallucinate words.
+
+
+================================================================
+6. FULL FUNCTION SIGNATURES
+================================================================
+
+FUNCTION detect_pdf_type(pdf_path)
+    -> (pdf_type: "digital" | "scanned", diagnostics: dict)
+
+FUNCTION extract_digital_text(pdf_path) -> str
+
+FUNCTION render_pages_to_images(pdf_path, dpi=300)
+    -> list[PIL.Image.Image]
+
+FUNCTION check_image_quality(image, page_no)
+    -> (should_skip: bool, reason: str | None)
+
+FUNCTION preprocess_for_ocr(image) -> PIL.Image.Image
+
+FUNCTION run_tesseract(image, lang="eng+chi_tra", psm=6) -> str
+
+FUNCTION _process_one_page(page_no, raw_img)
+    -> (page_no, text | None, skip_reason | None)
+
+FUNCTION extract_scanned_text(pdf_path, max_workers=8) -> dict
+
+FUNCTION sha256_of_file(path) -> str
+
+FUNCTION extract_pdf(pdf_path) -> dict
+    Main entry point. Detects type, routes, returns the output
+    contract dict defined in section 1.
+
+
+================================================================
+7. DEPENDENCIES
+================================================================
+
+Python packages:
+    pdfplumber
+    PyMuPDF
+    pytesseract
+    Pillow
+    openai
+
+System packages:
+    tesseract-ocr
+    tesseract-ocr-chi-tra
+
+Note: poppler-utils is NOT required. PyMuPDF replaces pdf2image
+for rendering.
+
+Install (Python):
+    pip install pdfplumber PyMuPDF pytesseract Pillow openai
+
+Install (system):
+    Windows:
+        Download Tesseract installer from
+        https://github.com/UB-Mannheim/tesseract/wiki
+        During installation, tick:
+            - Add to PATH (optional)
+            - Additional language data: Chinese Traditional
+
+    macOS:
+        brew install tesseract tesseract-lang
+
+    Ubuntu/Debian:
+        sudo apt install tesseract-ocr tesseract-ocr-chi-tra
+
+Windows note:
+    If Tesseract is not on PATH, add this line near the top of
+    read_pdf.py:
+
+        pytesseract.pytesseract.tesseract_cmd = \
+            r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+
+Verify:
+    tesseract --version
+    tesseract --list-langs    (should show eng and chi_tra)
+
+
+================================================================
+8. OUTPUT CONVENTION
+================================================================
+
+On every successful extraction, Module 1 writes two files to
+output/ (created if missing):
+
+    1. output/<pdf_stem>_<engine>.txt
+       The extracted text, UTF-8.
+
+    2. output/<pdf_stem>_meta.json
+       The extraction_meta dict, pretty-printed, UTF-8.
+
+Overwrite behaviour:
+    Existing files with the same name are overwritten. This is
+    intentional for iterative tuning.
+
+
+================================================================
+9. WHAT MODULE 1 DOES NOT DO
+================================================================
+
+    - Guess which bank the PDF is from.
+    - Slice out the "Transaction History" section.
+    - Call DeepSeek's text model for parsing.
+    - Write any CSV.
+    - Validate that numbers add up.
+    - Interpret handwriting (deferred).
+
+Module 1's only job: turn a PDF into trustworthy text plus a
+clear label of its origin and quality.
+
+
+================================================================
+10. FAILURE POLICY
+================================================================
+
+STOP and raise on:
+    - PDF file unreadable or corrupted
+    - PDF has zero pages
+    - Digital extraction returns empty text
+    - All scanned pages skipped or empty after OCR
+    - Tesseract binary not found
+
+WARN and continue on:
+    - One or two pages produce low-quality OCR
+    - Hybrid PDF detected
+    - Low-resolution page image
+
+Never silently return an empty string.
+
+
+================================================================
+11. AUDIT TRAIL CONTRIBUTIONS
+================================================================
+
+Module 1 contributes the extraction_meta dict to the run's
+sidecar JSON. The output/<pdf_stem>_meta.json file is exactly
+this dict.
+
+
+================================================================
+12. OPEN QUESTIONS DEFERRED TO LATER VERSIONS
+================================================================
+
+    - DeepSeek Vision for handwriting.
+    - Table-mode extraction for banks whose layout=True output
+      is unreadable.
+    - Adaptive binarization for poor-quality scans.
+    - Rotation detection and correction for skewed scans.
+    - Multi-language OCR beyond eng+chi_tra.
+    - PDF password handling.
+    - Timestamped output filenames.
+    - File-level parallelism for batch processing multiple PDFs.
+
+Each should be added only when a real PDF demands it.
+
+
+================================================================
+END OF SPECIFICATION
+================================================================

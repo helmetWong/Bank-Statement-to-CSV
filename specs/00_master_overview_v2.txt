@@ -1,0 +1,440 @@
+================================================================
+BANK STATEMENT PDF → CSV AUTOMATION
+MASTER OVERVIEW & OBJECTIVES
+Version 2.0
+Last updated: 2026-10-01
+Supersedes: 00_master_overview.txt (v1.0, 2026-09-17)
+================================================================
+
+HOW TO USE THIS DOCUMENT
+------------------------
+This is the entry point for every coding chat. Paste this file
+first, then paste the specific module spec that the chat will
+work on. Each chat is therefore self-contained.
+
+Module specs (current versions):
+    module1_extract_spec_v3.txt    (PDF -> text)
+    module2_api_spec_v1.txt        (text -> DeepSeek -> JSON)
+    module3_json_to_csv_spec_v1.txt (JSON -> CSV)
+
+If you only have room for one file, paste this one. It contains
+enough context to reconstruct the project's intent, structure,
+and interfaces.
+
+
+================================================================
+PART A — PROJECT OBJECTIVES
+================================================================
+
+A1. PRIMARY OBJECTIVE
+---------------------
+Build a Python pipeline that converts Hong Kong bank statement
+PDFs into accounting-ready CSV files, using the DeepSeek API
+for parsing, driven by user-editable configuration files and
+natural-language style instructions rather than code changes.
+
+The user is a Hong Kong CPA who codes in Python. The pipeline
+is personal tooling, not a commercial product, but it must
+satisfy professional audit standards for traceability.
+
+
+A2. INPUTS
+----------
+1. Bank statement PDFs, in input/.
+   Two varieties:
+       - Digital PDFs downloaded from online banking
+       - Scanned PDFs, possibly with handwritten annotations
+
+2. config/config.csv — per-run task configuration.
+   Converted to config/config.json by utilities.py.
+
+3. config/styles/<style>.txt — natural-language instruction
+   file per bank. This is the single source of parsing rules.
+
+4. key/<Key_file> — text file with the DeepSeek API key.
+
+5. output/<pdf_stem>_<engine>.txt — OCR text from Module 1.
+
+
+A3. OUTPUTS
+-----------
+1. output/json/<pdf_stem>_stmt<N>.json
+   One file per statement chunk, containing DeepSeek's raw
+   JSON response.
+
+2. output/csv/<filename>.csv
+   Merged CSV files ready for accounting use. UTF-8 with BOM
+   for Excel on Windows/HK.
+
+3. output/<pdf_stem>_meta.json
+   Module 1's extraction metadata (audit contribution).
+
+
+A4. DESIGN PRINCIPLES
+---------------------
+P1. Configuration over code.
+    Adding a new bank means adding a new style text file. No
+    Python changes.
+
+P2. Fail loudly, never silently.
+    Any mismatch, missing file, or invalid input STOPS the
+    run. A clean failure is better than a plausible wrong
+    answer.
+
+P3. Separate concerns into modules.
+    Each module does one thing. Interfaces between modules are
+    explicit dicts, documented in the specs.
+
+P4. Audit trail by default.
+    Every run produces metadata. Every style has a version and
+    changelog.
+
+P5. Trust levels are explicit.
+    Printed bank text is trusted. Tesseract OCR is
+    semi-trusted. Handwriting (future) is untrusted.
+
+P6. Defer complexity.
+    Add each feature only when a real input demands it.
+
+P7. Cost awareness.
+    Split input to fit within output token budgets. Prefer
+    local operations over API calls for iteration. Batch API
+    calls during off-peak hours.
+
+P8. Natural language over rigid schema.
+    Bank layouts are not structurally uniform. A style text
+    file captures per-bank quirks better than a JSON schema.
+
+
+A5. NON-GOALS (out of scope for the current version)
+----------------------------------------------------
+    - Web interface or GUI
+    - Multi-user / multi-tenant
+    - Database storage
+    - Automatic bank-format change detection
+    - Posting directly into accounting software
+    - Handling PDF passwords
+    - Multi-language OCR beyond eng + chi_tra
+    - Real-time or streaming processing
+
+
+================================================================
+PART B — MODULE STRUCTURE
+================================================================
+
+B1. PIPELINE VIEW
+-----------------
+
+    input/<pdf>
+          |
+          v
+    +-------------------+
+    |  MODULE 1         |   PDF -> text
+    |  read_pdf.py      |   (digital or scanned+OCR)
+    +---------+---------+
+              |
+              | output/<stem>_tesseract.txt
+              | output/<stem>_meta.json
+              v
+    +-------------------+
+    |  MODULE 2         |   text + style + config -> API
+    |  txt_to_json_API  |   -> JSON envelopes
+    +---------+---------+
+              |
+              | output/json/<stem>_stmt<N>.json
+              v
+    +-------------------+
+    |  MODULE 3         |   JSON -> CSV
+    |  json_to_csv.py   |   (merge, sanitize, write)
+    +---------+---------+
+              |
+              v
+    output/csv/<filename>.csv
+
+
+B2. MODULE 1 — PDF TEXT EXTRACTION
+----------------------------------
+FILE:         read_pdf.py
+SPEC:         module1_extract_spec_v3.txt
+PURPOSE:      Turn a PDF into trustworthy text with explicit
+              labels of origin and quality.
+INPUT:        pdf_path
+OUTPUT:       dict {pdf_type, text, handwriting,
+                   page_count, extraction_meta}
+KEY LOGIC:    - Detect digital vs scanned (chars/page)
+              - Digital: pdfplumber, layout=True
+              - Scanned: PyMuPDF render -> PIL preprocess ->
+                parallel Tesseract OCR
+              - Output to output/<stem>_<engine>.txt
+              - Metadata to output/<stem>_meta.json
+DEPENDS ON:   pdfplumber, PyMuPDF, pytesseract, Pillow
+              system tesseract-ocr + tesseract-ocr-chi-tra
+DOES NOT:     - Guess the bank
+              - Slice sections
+              - Call the text LLM
+              - Write CSV
+
+
+B3. MODULE 2 — DEEPSEEK API CONNECTOR
+-------------------------------------
+FILE:         txt_to_json_API.py
+SPEC:         module2_api_spec_v1.txt
+PURPOSE:      Read config + style + OCR text, split into
+              statements, call DeepSeek per statement, save
+              raw JSON responses.
+INPUT:        config.json, style text, OCR text, API key
+OUTPUT:       output/json/<stem>_stmt<N>.json
+KEY LOGIC:    - Split OCR on "HSBC Business Direct Statement"
+              - Build system prompt with MANDATORY numeric
+                formatting rules (fix for ISSUE-001)
+              - Build user prompt with style + task context
+                + OCR chunk + ending reminder
+              - Call DeepSeek (thinking disabled, JSON mode,
+                temperature 0)
+              - Retry on transient errors and empty content
+              - Save each response as separate JSON file
+DEPENDS ON:   openai SDK, DEEPSEEK_API_KEY from key/<file>
+DOES NOT:     - Convert JSON to CSV (deferred to Module 3)
+              - Validate arithmetic
+              - Merge across statements
+
+
+B4. MODULE 3 — JSON TO CSV WRITER
+---------------------------------
+FILE:         json_to_csv.py
+SPEC:         module3_json_to_csv_spec_v1.txt
+PURPOSE:      Read Module 2's JSON files, sanitize numeric
+              fields, merge by filename, write CSVs.
+INPUT:        output/json/*_stmt*.json
+OUTPUT:       output/csv/<filename>.csv
+KEY LOGIC:    - Find and sort JSON files by stmt number
+              - Warn if any statement number is missing
+              - Parse each CSV block with csv.reader
+              - Clean numeric fields (strip thousands
+                separators)
+              - Re-emit via csv.writer (proper quoting)
+              - Merge by filename, keep one header
+              - Write UTF-8 with BOM
+DEPENDS ON:   Modules 1-2 output files. No API.
+DOES NOT:     - Call any API
+              - Re-interpret source text
+              - Re-sort or deduplicate (deferred)
+
+
+B5. INTERFACE SUMMARY TABLE
+---------------------------
+From        To          Data shape
+----------  ----------  --------------------------------------
+Module 1    Module 2    OCR text file + meta.json
+Module 2    Module 3    JSON envelopes (one per statement)
+Module 3    Filesystem  CSV files + summary output
+
+No module reaches around its neighbour. Module 3 never calls
+DeepSeek. Module 2 never writes CSV. This is enforced by
+keeping each module's imports narrow.
+
+
+================================================================
+PART C — FILE & DIRECTORY LAYOUT
+================================================================
+
+project/
+├── specs/
+│   ├── 00_master_overview_v2.txt    <- this file
+│   ├── module1_extract_spec_v3.txt
+│   ├── module2_api_spec_v1.txt
+│   └── module3_json_to_csv_spec_v1.txt
+├── config/
+│   ├── config.csv                   <- per-run, edited often
+│   ├── config.json                  <- generated
+│   └── styles/
+│       └── hsbc_hk.txt              <- natural-language rules
+├── key/
+│   └── deepseek_key.txt             <- API key, not committed
+├── input/
+│   └── HSBC_full_hk.pdf
+├── output/
+│   ├── HSBC_full_hk_tesseract.txt   <- Module 1
+│   ├── HSBC_full_hk_meta.json       <- Module 1
+│   ├── json/                        <- Module 2
+│   │   ├── HSBC_full_hk_stmt1.json
+│   │   └── ...
+│   └── csv/                         <- Module 3
+│       ├── hsbc_123-..._HKD_savings_2024-2025.csv
+│       └── ...
+├── utilities.py                     <- config.csv -> json
+├── read_pdf.py                      <- Module 1
+├── txt_to_json_API.py               <- Module 2
+└── json_to_csv.py                   <- Module 3
+
+
+================================================================
+PART D — CURRENT STATUS
+================================================================
+
+D1. WHAT WORKS
+--------------
+- Module 1: digital and scanned paths, parallel OCR, output
+  to text + meta JSON.
+- Module 2: statement splitting, API call with retry, numeric
+  formatting rules in system prompt, one JSON per statement.
+- Module 3: JSON merge, numeric sanitization, missing-statement
+  warning, UTF-8 BOM output.
+- End-to-end test on a 29-page scanned HSBC statement:
+  22 statements identified, 21 succeeded on first pass.
+
+D2. KNOWN ISSUES
+----------------
+- ISSUE-001 (numeric thousands separators): resolved by
+  moving rules into the system prompt. Client-side sanitizer
+  in Module 3 as a safety net.
+- Statement 14 of 22 failed. Cause not diagnosed. Module 2
+  does not log failed responses; adding this is the next
+  improvement.
+- Result accuracy: approximately 99.0-99.5%. Minor manual
+  corrections remain.
+- Module 3 does not sort or deduplicate after merging. If
+  source statements are in reverse chronological order, the
+  merged CSV may not be chronological.
+
+D3. DEFERRED FEATURES
+---------------------
+- DeepSeek Vision for handwritten annotations.
+- Per-page splitting for statements that exceed the
+  output token budget.
+- Failed-response logging for diagnosis.
+- Resume mode for Module 2 (skip statements that already
+  have a JSON file).
+- Post-merge date sorting and deduplication in Module 3.
+- Re-computation of "end of month" remarks after merge.
+- Sidecar summary JSON for Module 3.
+
+
+================================================================
+PART E — CONVENTIONS
+================================================================
+
+E1. Naming
+    Files:     snake_case for Python
+    Styles:    <bank_shortcode>.txt, e.g. hsbc_hk.txt
+    Versions:  "YYYY.MM" as string
+    Outputs:   <pdf_stem>_<engine>.txt      (Module 1)
+               <pdf_stem>_stmt<N>.json      (Module 2)
+               <bank>_<acct>_<ccy>_<type>_<period>.csv
+                                            (Module 3)
+
+E2. Encoding
+    CSV:   utf-8-sig  (BOM for Excel on HK Windows)
+    JSON:  utf-8 (no BOM)
+
+E3. Logging
+    Every module prints a clear header line and per-item
+    progress. Failures are always printed with [FAILED] or
+    [WARN] prefix.
+
+E4. Errors
+    Custom exceptions per module:
+        Module1Error, Module2Error, Module3Error
+    Never swallow exceptions silently.
+    Retry only network and rate-limit failures, never
+    deterministic failures (bad input).
+
+E5. Language for LLM
+    System prompt and style files in English. Chinese is only
+    used inside the OCR data.
+
+E6. Secrets
+    API key stored in key/<Key_file>. key/ and output/ added
+    to .gitignore. Never commit the key file.
+
+
+================================================================
+PART F — LESSONS LEARNED
+================================================================
+
+L1. Long inputs can trigger empty API responses.
+    With thinking mode enabled, the model may consume the
+    entire max_tokens budget on internal reasoning and produce
+    no content. Disabling thinking resolved this.
+
+L2. Even with thinking disabled, large outputs can exceed
+    the budget. Splitting input by statement keeps each
+    call's output within max_tokens.
+
+L3. Rules buried in long prompts are less reliable than
+    rules in the system prompt with positive and negative
+    examples. The system prompt is the authoritative place
+    for mandatory formatting rules.
+
+L4. Local file operations are free. Do not re-call the API
+    for CSV formatting tweaks. Module 3 is re-runnable.
+
+L5. Client-side sanitization cannot recover data that is
+    already split. Prevention via prompt is better than
+    correction via code.
+
+L6. Detecting gaps (missing statement numbers) explicitly
+    is worth the extra few lines. Silent gaps are dangerous
+    in accounting work.
+
+
+================================================================
+PART G — WHEN STARTING A NEW CHAT
+================================================================
+
+Paste this master overview first, then paste the specific
+module spec the chat will focus on. Then state the concrete
+task, e.g.:
+
+    "Improve Module 2 to log failed responses and add a
+     resume mode that skips statements whose JSON file
+     already exists. Use the spec module2_api_spec_v1.txt
+     as the authoritative design."
+
+Do not paste other module specs unless they are needed for
+interface reference. This keeps the chat context small and
+focused.
+
+When a change is made, bump the version number in the module
+spec and add a line under CHANGES FROM. The spec becomes the
+single source of truth.
+
+
+================================================================
+PART H — RECOMMENDED NEXT STEPS
+================================================================
+
+Ordered by value:
+
+1. Diagnose statement 14's failure.
+   Add failed-response logging to Module 2 (save the raw
+   response or error to output/json/_failed/), re-run, and
+   inspect the cause. Without this, one in twenty statements
+   will keep failing silently.
+
+2. Add resume mode to Module 2.
+   Skip statements whose JSON file already exists. Saves
+   both time and tokens when re-running after a partial
+   failure.
+
+3. Add post-merge processing to Module 3.
+   Sort rows by date. Deduplicate on (date, details_eng,
+   deposit, withdrawal, balance). Ensure "end of month"
+   remarks are placed at the correct month boundary.
+
+4. Strengthen the style file based on observed errors.
+   Each manual correction you made in the first run points
+   to a rule that the model missed. Add those rules to
+   hsbc_hk.txt, with examples.
+
+5. Defer DeepSeek Vision for handwriting until a scanned
+   statement with handwriting actually appears in your
+   workflow.
+
+Each of these should be done in a separate chat, with the
+relevant spec pasted at the top.
+
+
+================================================================
+END OF MASTER OVERVIEW v2
+================================================================
